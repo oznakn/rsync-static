@@ -1,0 +1,124 @@
+name: Release rsync-static
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions: write-all
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Show release info
+        run: |
+          echo "Release tag: ${{ github.event.release.tag_name }}"
+          echo "Ref name:    ${{ github.ref_name }}"
+
+      - name: Compute rsync version from tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Use the release's tag name if available, otherwise fall back to ref_name
+          RAW_TAG="${{ github.event.release.tag_name || github.ref_name }}"
+          # Strip a leading 'v' if present (e.g., v3.3.0 -> 3.3.0)
+          VERSION="${RAW_TAG#v}"
+          # Also handle tags like 'rsync-3.3.0' -> '3.3.0'
+          VERSION="${VERSION#rsync-}"
+          echo "Normalized version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download rsync tarball and extract
+        id: download
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          BASE="https://download.samba.org/pub/rsync/src"
+          URL_XZ="$BASE/rsync-$VERSION.tar.xz"
+          URL_GZ="$BASE/rsync-$VERSION.tar.gz"
+
+          echo "Trying $URL_XZ"
+          if curl -Ifs "$URL_XZ" >/dev/null; then
+            URL="$URL_XZ"
+            TARBALL="rsync-$VERSION.tar.xz"
+          else
+            echo "Trying $URL_GZ"
+            if curl -Ifs "$URL_GZ" >/dev/null; then
+              URL="$URL_GZ"
+              TARBALL="rsync-$VERSION.tar.gz"
+            else
+              echo "Could not find rsync-$VERSION tarball at $URL_XZ or $URL_GZ" >&2
+              exit 1
+            fi
+          fi
+
+          echo "Downloading $URL -> $TARBALL"
+          curl -fL "$URL" -o "$TARBALL"
+
+          mkdir -p rsync-extracted
+          case "$TARBALL" in
+            *.tar.xz) tar -xJf "$TARBALL" -C rsync-extracted ;;
+            *.tar.gz) tar -xzf "$TARBALL" -C rsync-extracted ;;
+            *) echo "Unknown archive format: $TARBALL" >&2; exit 1 ;;
+          esac
+
+          mv rsync-extracted/rsync-$VERSION rsync-src
+
+          echo "Contents:"
+          ls -la rsync-src
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          push: true
+          tags: |
+            "ghcr.io/oznakn/rsync-static:${{ steps.version.outputs.version }}"
+
+      - name: Get rsync files from docker images
+        id: get-files
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          ARCHS=("amd64" "arm64" "arm/v7")
+
+          mkdir -p output
+
+          for ARCH in "${ARCHS[@]}"; do
+            ARCH_SAFE=${ARCH//\//-}  # Replace '/' with '-' for filenames
+
+            CONTAINER_ID=$(docker create --platform "linux/$ARCH" "ghcr.io/oznakn/rsync-static:$VERSION")
+            docker cp "$CONTAINER_ID:/usr/local/src/rsync" "output/rsync-static-$VERSION-linux-$ARCH_SAFE"
+            docker rm "$CONTAINER_ID"
+          done
+
+          echo "Files in output/:"
+          ls -la output/
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: output/rsync-*
